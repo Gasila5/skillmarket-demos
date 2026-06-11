@@ -805,7 +805,7 @@ function seedPositions(){return [
 ];}
 let POS=seedPositions();
 
-let RISK={open:1,openMax:2,expo:0.2857,expoMax:1.0,loss:0,lossMax:0.5,consec:0,consecMax:3,killed:false};
+let RISK={open:1,openMax:20,expo:0.2857,expoMax:1.0,loss:0,lossMax:0.5,consec:0,consecMax:3,killed:false};
 const P=x=>Math.round(x*100)+'%';
 const gst=(t,i)=>t.died===null?(i<5?'pass':'pass'):i<t.died?'pass':i===t.died?'fail':'skip';
 
@@ -1077,7 +1077,7 @@ function setSource(s){
   if(s==='backend'){mcp.textContent='LIVE';mcp.style.color='var(--lime)';
     if(beReady){bePolling=true;scanCycle();}              // 环境已有 key，直接轮询，不弹框
     else{toast(t('toast_be_switched'),'ok');openCfg();}}
-  else{mcp.textContent='DEMO';mcp.style.color='var(--amber)';loadingScreen=false;T=freshSeed();POS=seedPositions();RISK={open:1,openMax:2,expo:0.2857,expoMax:1.0,loss:0,lossMax:0.5,consec:0,consecMax:3,killed:false};sel=-1;cycles=1;renderAll(false);}
+  else{mcp.textContent='DEMO';mcp.style.color='var(--amber)';loadingScreen=false;T=freshSeed();POS=seedPositions();RISK={open:1,openMax:20,expo:0.2857,expoMax:1.0,loss:0,lossMax:0.5,consec:0,consecMax:3,killed:false};sel=-1;cycles=1;renderAll(false);}
 }
 
 /* ── config modal ── */
