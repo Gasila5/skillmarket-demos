@@ -24,7 +24,7 @@ app.py — GMGN AI Trader 本地后端 (FastAPI)
 """
 
 from __future__ import annotations
-import json, os, re, subprocess, random, datetime, pathlib, threading, math, shlex
+import json, os, re, subprocess, random, datetime, pathlib, threading, math, shlex, time
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 
@@ -134,6 +134,8 @@ def default_trending_cmd(chain: str = "sol") -> str:
             f"--direction desc --limit 100 --chain {chain} --raw")
 DEFAULT_TRENDING_CMD = default_trending_cmd("sol")   # 兼容旧引用
 DEFAULT_POLL_S = 5.6
+# 同链 trending 短缓存：TTL 内多个 tab/请求复用同一次 cli 结果（同链多开不放大配额）。
+TRENDING_CACHE_TTL = 3.0
 
 # ──────────────────────────────────────────────────────────────────────────
 # 1. .env 读写（凭据落地本机）
@@ -600,19 +602,23 @@ class RiskManager:
             return False, "BLOCK 超出总敞口上限"
         return True, "ok"
 
+SUPPORTED_CHAINS = ("sol", "bsc", "base", "eth")
+
 class AppState:
+    """链改为「请求维度」：不再有全局当前链，按链缓存 adapter + trending 结果。
+    mode/risk/positions 仍全局（钱包级、跨链合一）。self.chain 仅作启动默认 + status 展示。"""
     def __init__(self):
         self.lock = threading.Lock()
-        self.mode = "SHADOW"          # SHADOW | LIVE
-        self.chain = CFG["chain"]
-        self.adapter: GMGNAdapter = MockGMGN()   # 默认 Mock，配 key 后切 Live
-        self.is_live_adapter = False
+        self.mode = "SHADOW"          # SHADOW | LIVE（钱包级安全设置，全局）
+        self.chain = CFG["chain"]     # 启动默认链（仅用于未带 chain 的请求兜底 + status 展示）
+        self.live = False             # 是否已配 key（决定按链建 Live 还是 Mock 适配器）
+        self._adapters: dict[str, GMGNAdapter] = {}              # chain -> 适配器（缓存）
+        self._mock = MockGMGN()                                  # 无 key 时所有链共用一个 Mock
+        self._trending_cache: dict[str, tuple] = {}             # chain -> (monotonic_ts, rows)
         self.risk = RiskManager()
         self.positions: list[dict] = []          # 每项含 entry 快照 + cycles + chain
-        self.last_screen: list[dict] = []
         self.trending_cmds: dict[str, str] = {}   # 按链记忆热榜命令
-        # 启动即读环境 key：~/.config/gmgn/.env 有 API key 就自动切真实数据适配器，
-        # 前端刷新后无需重填 key（交易仍由 LIVE_TRADING_DISABLED 锁着，只读真实行情）。
+        # 启动即读环境 key：有 API key 就走真实数据适配器（交易仍要 LIVE 模式 + 私钥）。
         env = load_env()
         if env.get("GMGN_API_KEY"):
             self.chain = env.get("GMGN_CHAIN", self.chain) or self.chain
@@ -621,20 +627,52 @@ class AppState:
             except Exception:
                 pass
 
-    def get_trending_cmd(self) -> str:
-        return self.trending_cmds.get(self.chain) or default_trending_cmd(self.chain)
+    @property
+    def is_live_adapter(self) -> bool:   # 兼容旧引用（status / 监控判分支）
+        return self.live
 
-    def set_trending_cmd(self, cmd: str):
-        self.trending_cmds[self.chain] = cmd
+    def adapter_for(self, chain: str) -> GMGNAdapter:
+        """取某链的适配器（按链缓存）。无 key → 共用 Mock；有 key → 各链一个 LiveGMGN（同 key 仅 --chain 不同）。"""
+        if not self.live:
+            return self._mock
+        a = self._adapters.get(chain)
+        if a is None:
+            a = LiveGMGN(chain)
+            self._adapters[chain] = a
+        return a
+
+    def use_live(self):
+        """配了 key：标记走真实数据，清空适配器缓存（让各链按需重建为 Live）。"""
+        self.live = True
+        self._adapters.clear()
+        self._trending_cache.clear()
+
+    def get_trending_cmd(self, chain: str) -> str:
+        return self.trending_cmds.get(chain) or default_trending_cmd(chain)
+
+    def set_trending_cmd(self, chain: str, cmd: str):
+        self.trending_cmds[chain] = cmd
+
+    def trending_rows(self, chain: str) -> list:
+        """取某链热榜行：TTL 内复用缓存（同链多 tab 共享一次 cli），过期才真打 cli。"""
+        now = time.monotonic()
+        hit = self._trending_cache.get(chain)
+        if hit and (now - hit[0]) < TRENDING_CACHE_TTL:
+            return hit[1]
+        rows = self.adapter_for(chain).market_trending(cmd=self.get_trending_cmd(chain))
+        self._trending_cache[chain] = (now, rows)
+        return rows
 
     def exposure(self):
         return round(sum(p["size_sol"] for p in self.positions), 4)
 
-    def use_live(self):
-        self.adapter = LiveGMGN(self.chain)
-        self.is_live_adapter = True
-
 ST = AppState()
+
+def valid_chain(ch: str) -> str:
+    ch = (ch or "").lower()
+    if ch not in SUPPORTED_CHAINS:
+        raise HTTPException(400, f"不支持的链：{ch}")
+    return ch
 
 # ──────────────────────────────────────────────────────────────────────────
 # 10. 日志（私有 ground truth；反馈飞轮的原料）
@@ -668,13 +706,13 @@ def log(action: str, symbol: str, reason: str, extra: dict | None = None):
 # ──────────────────────────────────────────────────────────────────────────
 # 11. 筛选流水线（核心：确定性先筛 → 评分 → LLM 只判幸存者 → 产候选，不执行）
 # ──────────────────────────────────────────────────────────────────────────
-def screen_once() -> dict:
-    g = ST.adapter
+def screen_once(chain: str) -> dict:
+    g = ST.adapter_for(chain)
     fx = FeatureExtractor(g)
     judge = LLMJudge()
 
-    # STEP 1 trending（便宜，行内已含富字段）→ top-N 粗筛（砍掉大半尽调请求）
-    candidates = g.market_trending(cmd=ST.get_trending_cmd())
+    # STEP 1 trending（便宜，行内已含富字段；同链 TTL 内复用缓存）→ top-N 粗筛
+    candidates = ST.trending_rows(chain)
     candidates = candidates[:CFG["top_n_prefilter"]]
 
     decisions, survivors = [], []
@@ -723,7 +761,7 @@ def screen_once() -> dict:
 
     # 持仓逃生监控（与筛选同一轮跑）；把本轮热榜行喂进去，持仓在榜则零额外 cli
     rows_by_addr = {t["address"]: t for t in candidates if t.get("address")}
-    positions_out = monitor_positions(rows_by_addr)
+    positions_out = monitor_positions(chain, rows_by_addr)
 
     return dict(decisions=decisions, portfolio=_portfolio(), positions=positions_out)
 
@@ -739,7 +777,7 @@ def _public_broadcast_loop():
     while not stop.is_set():
         try:
             with ST.lock:
-                screened = screen_once()
+                screened = screen_once(ST.chain)   # 公开演示单链广播（默认链）
             _PUBLIC_CACHE["data"] = _public_payload(screened)
             _PUBLIC_CACHE["err"] = None
         except Exception as e:
@@ -777,12 +815,12 @@ def _sec_from_row(row: dict) -> dict:
                 burn_ratio=_f(row.get("burn_ratio")),
                 top10=_f(row.get("top_10_holder_rate")))
 
-def monitor_positions(rows_by_addr: dict | None = None) -> list[dict]:
+def monitor_positions(chain: str, rows_by_addr: dict | None = None) -> list[dict]:
     rows_by_addr = rows_by_addr or {}
     out = []
-    g = ST.adapter
+    g = ST.adapter_for(chain)
     for p in ST.positions:
-        if p.get("chain", "sol") != ST.chain:    # 只监控当前链的持仓
+        if p.get("chain", "sol") != chain:       # 只监控该链的持仓
             continue
         p["cycles"] = p.get("cycles", 0) + 1
         if ST.is_live_adapter:
@@ -832,13 +870,13 @@ def _mock_drift(p):
 # ──────────────────────────────────────────────────────────────────────────
 # 12. 成交（人按下才发生）
 # ──────────────────────────────────────────────────────────────────────────
-def do_buy(address: str, size_sol: float) -> dict:
+def do_buy(chain: str, address: str, size_sol: float) -> dict:
     # 成交前再过一次组合风控（硬拦；与筛选时的提示分离）
     allow, rnote = ST.risk.gate(size_sol, len(ST.positions), ST.exposure())
     if not allow:
         log("BUY_BLOCK", address[:8], rnote)
         raise HTTPException(409, rnote)
-    g = ST.adapter
+    g = ST.adapter_for(chain)
     info = g.token_info(address)
     sec  = g.token_security(address)             # 已归一化安全快照（建仓基线，逃生 diff 用）
     entry = dict(honeypot=sec.get("honeypot", False),
@@ -856,8 +894,8 @@ def do_buy(address: str, size_sol: float) -> dict:
     if ST.mode == "LIVE" and not LIVE_TRADING_DISABLED:
         try:
             wallet = g.wallet_address()              # 绑定 Key 的本链钱包，--from 必须一致
-            amount = int(size_sol * (10 ** native_decimals(ST.chain)))
-            order = g.swap(from_wallet=wallet, input_token=native_token(ST.chain),
+            amount = int(size_sol * (10 ** native_decimals(chain)))
+            order = g.swap(from_wallet=wallet, input_token=native_token(chain),
                            output_token=address, amount=amount, slippage=0.01)
         except Exception as e:                       # gmgn-cli 报错(如缺签名密钥)→ 不建仓，回清晰错误
             log("BUY_FAIL", symbol, str(e))
@@ -871,10 +909,10 @@ def do_buy(address: str, size_sol: float) -> dict:
         status = "SHADOW（未真实发送，需切 LIVE + 配签名密钥）"
 
     ST.positions.append(dict(symbol=symbol, address=address, size_sol=round(size_sol, 4),
-                             pnl=0.0, cycles=0, entry=entry, chain=ST.chain,
+                             pnl=0.0, cycles=0, entry=entry, chain=chain,
                              entry_price=entry_price, cur_price=entry_price))
     save_positions()
-    log("BUY", symbol, f"{ST.mode} 成交 {size_sol} SOL", dict(size_sol=size_sol, **exit_plan()))
+    log("BUY", symbol, f"{ST.mode} 成交 {size_sol} ({chain})", dict(size_sol=size_sol, chain=chain, **exit_plan()))
     return dict(ok=True, status=status, symbol=symbol)
 
 def do_sell(address: str) -> dict:
@@ -882,12 +920,13 @@ def do_sell(address: str) -> dict:
     if idx is None:
         raise HTTPException(404, "未找到该持仓")
     p = ST.positions[idx]
+    pchain = p.get("chain", "sol")               # 用持仓自带链，避免用错链的 adapter/原生币
     if ST.mode == "LIVE" and not LIVE_TRADING_DISABLED:
-        g = ST.adapter
-        # 清仓：input=持仓币(非 currency，可用 percent)，output=本链原生币，percent=100 全清。
+        g = ST.adapter_for(pchain)
+        # 清仓：input=持仓币(非 currency，可用 percent)，output=该链原生币，percent=100 全清。
         try:
             g.swap(from_wallet=g.wallet_address(), input_token=address,
-                   output_token=native_token(ST.chain), percent=100, slippage=0.02)
+                   output_token=native_token(pchain), percent=100, slippage=0.02)
         except Exception as e:                       # 卖出失败→保留持仓，回清晰错误
             log("SELL_FAIL", p["symbol"], str(e))
             raise HTTPException(502, f"链上卖出失败：{e}")
@@ -921,18 +960,23 @@ app = FastAPI(title="GMGN AI Trader (local)")
 class ConfigIn(BaseModel):
     api_key: str = ""        # 留空则沿用环境里已有的 key（不覆盖）
     signing_key: str = ""
-    chain: str = "sol"
+    chain: str = "sol"       # 仅作首次写 env 的默认链；UI 切链不经此
     mode: str = "SHADOW"
 
 class BuyIn(BaseModel):
     address: str
     size_sol: float
+    chain: str = "sol"       # 链随请求传（每个 tab 独立）
 
 class SellIn(BaseModel):
-    address: str
+    address: str             # 卖出链由持仓自带，无需传
 
 class SettingsIn(BaseModel):
     trending_cmd: Optional[str] = None
+    chain: str = "sol"       # 改哪条链的热榜命令
+
+class RunIn(BaseModel):
+    chain: str = "sol"       # 筛哪条链（每个 tab 独立）
 
 class ChainIn(BaseModel):
     chain: str
@@ -944,11 +988,12 @@ def _block_if_public():
 
 @app.get("/api/status")
 def api_status():
-    """前端加载时探测：后端是否已就绪（环境有 key + 已切真实适配器），免去重填。"""
+    """前端加载时探测：后端是否已就绪（环境有 key + 已切真实适配器），免去重填。
+    chain 仅为启动默认链（前端各 tab 用自己的链，不依赖这个）。"""
     return dict(live_adapter=ST.is_live_adapter, chain=ST.chain, mode=ST.mode,
                 has_key=bool(load_env().get("GMGN_API_KEY")),
                 trading_locked=LIVE_TRADING_DISABLED, public_demo=PUBLIC_DEMO,
-                trending_cmd=ST.get_trending_cmd())
+                trending_cmd=ST.get_trending_cmd(ST.chain))
 
 @app.post("/api/config")
 def api_config(cfg: ConfigIn):
@@ -958,43 +1003,37 @@ def api_config(cfg: ConfigIn):
     if not cfg.api_key and not env.get("GMGN_API_KEY"):
         raise HTTPException(400, "缺少 api_key（环境也没有）")
     if cfg.api_key:
-        write_env(cfg.api_key, cfg.signing_key, ST.chain)   # 链用当前选择（链切换由 /api/chain 管，不靠这里）
+        # 保留环境里已有的默认链（GMGN_CHAIN 只作启动默认，不被 UI 选链快照覆盖）
+        write_env(cfg.api_key, cfg.signing_key, env.get("GMGN_CHAIN") or ST.chain)
     with ST.lock:
         # 安全护栏：LIVE_TRADING_DISABLED 为真时，即使请求 LIVE 也强制 SHADOW（绝不上链）
         want_live = cfg.mode.upper() == "LIVE"
         ST.mode = "LIVE" if (want_live and not LIVE_TRADING_DISABLED) else "SHADOW"
         try:
-            ST.use_live()      # 配了 key 即切真实数据适配器（只读真实行情，下单仍锁）
+            ST.use_live()      # 配了 key 即走真实数据适配器（按链按需建，只读真实行情）
         except Exception:
             pass               # gmgn-cli 未装时退回 Mock，仍可联调
-    return dict(ok=True, mode=ST.mode, chain=ST.chain, live_adapter=ST.is_live_adapter,
+    return dict(ok=True, mode=ST.mode, live_adapter=ST.is_live_adapter,
                 trading_locked=LIVE_TRADING_DISABLED)
 
 @app.post("/api/chain")
 def api_chain(c: ChainIn):
-    """切链：只改内存状态 + 重建适配器，不写 env（链状态由浏览器保存）。"""
+    """（兼容保留）返回某链的热榜命令；不再改全局状态——链已随各请求传递。"""
     _block_if_public()
-    ch = c.chain.lower()
-    if ch not in ("sol", "bsc", "base", "eth"):
-        raise HTTPException(400, f"不支持的链：{ch}")
-    with ST.lock:
-        ST.chain = ch
-        if ST.is_live_adapter:
-            try:
-                ST.use_live()   # 用新链重建 LiveGMGN（同一 key，仅 --chain 不同）
-            except Exception:
-                pass
-    return dict(ok=True, chain=ST.chain, trending_cmd=ST.get_trending_cmd())
+    ch = valid_chain(c.chain)
+    return dict(ok=True, chain=ch, trending_cmd=ST.get_trending_cmd(ch))
 
 @app.get("/api/settings")
-def api_settings_get():
-    return dict(trending_cmd=ST.get_trending_cmd(),
-                default_trending_cmd=default_trending_cmd(ST.chain),   # 按当前链返回默认
+def api_settings_get(chain: str = "sol"):
+    ch = valid_chain(chain)
+    return dict(trending_cmd=ST.get_trending_cmd(ch),
+                default_trending_cmd=default_trending_cmd(ch),
                 poll_interval_s=DEFAULT_POLL_S)
 
 @app.post("/api/settings")
 def api_settings(s: SettingsIn):
     _block_if_public()
+    ch = valid_chain(s.chain)
     with ST.lock:
         if s.trending_cmd is not None:
             cmd = s.trending_cmd.strip()
@@ -1005,11 +1044,12 @@ def api_settings(s: SettingsIn):
             # 安全护栏：只允许热榜命令，禁止借此执行任意命令
             if parts[:3] != ["gmgn-cli", "market", "trending"]:
                 raise HTTPException(400, "命令必须以 `gmgn-cli market trending` 开头")
-            ST.set_trending_cmd(cmd)
-    return dict(ok=True, trending_cmd=ST.get_trending_cmd())
+            ST.set_trending_cmd(ch, cmd)
+            ST._trending_cache.pop(ch, None)     # 命令变了，作废该链缓存
+    return dict(ok=True, trending_cmd=ST.get_trending_cmd(ch))
 
 @app.post("/api/run")
-def api_run():
+def api_run(r: RunIn):
     # 公开演示：不让访客触发 CLI，只回后台线程定时刷新的真实筛选缓存（配额与人数解耦）。
     if PUBLIC_DEMO:
         data = _PUBLIC_CACHE["data"]
@@ -1017,17 +1057,19 @@ def api_run():
             # 后台首轮还没跑完：返回空列表占位（前端继续轮询即可），不报错。
             return JSONResponse(dict(decisions=[], portfolio=None, positions=[]))
         return JSONResponse(data)
+    ch = valid_chain(r.chain)
     with ST.lock:
         try:
-            return JSONResponse(screen_once())
+            return JSONResponse(screen_once(ch))
         except Exception as e:
             raise HTTPException(502, f"扫描失败：{e}")
 
 @app.post("/api/buy")
 def api_buy(b: BuyIn):
     _block_if_public()
+    ch = valid_chain(b.chain)
     with ST.lock:
-        return do_buy(b.address, b.size_sol)
+        return do_buy(ch, b.address, b.size_sol)
 
 @app.post("/api/sell")
 def api_sell(s: SellIn):
@@ -1042,11 +1084,12 @@ def api_unmonitor(s: SellIn):
         return do_unmonitor(s.address)
 
 @app.get("/api/positions")
-def api_positions():
+def api_positions(chain: str = "sol"):
     if PUBLIC_DEMO:                       # 公开页不广播本机持仓
         return dict(positions=[], portfolio=None)
+    ch = valid_chain(chain)
     with ST.lock:
-        return dict(positions=monitor_positions(), portfolio=_portfolio())
+        return dict(positions=monitor_positions(ch), portfolio=_portfolio())
 
 # 静态前端（同源，避免 CORS）。把上一版 dashboard 存为 static/index.html
 if STATIC_DIR.exists():

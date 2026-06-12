@@ -725,23 +725,20 @@ function updateAmtUnit(){const u=document.getElementById('amtUnit');if(u)u.textC
 function toggleChainMenu(){const m=document.getElementById('chainMenu');m.classList.toggle('on');
   [...m.children].forEach(d=>d.classList.toggle('sel',d.dataset.ch===curChain));}
 function closeChainMenu(){document.getElementById('chainMenu').classList.remove('on');}
-async function switchChain(ch){
+function switchChain(ch){
   closeChainMenu();
   if(ch===curChain)return;
-  try{
-    if(source==='backend'){
-      const r=await fetch(API+'/api/chain',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chain:ch})});
-      if(!r.ok)throw new Error('HTTP '+r.status);
-    }
-    curChain=ch;
-    localStorage.setItem('aitrader_chain',ch);
-    document.getElementById('chainPill').textContent=CHAIN_LABEL[ch];
-    buyAmount=loadBuyAmt(ch);
-    const ai=document.getElementById('amtInput');if(ai)ai.value=buyAmount;
-    updateAmtUnit();
-    toast(t('toast_chain_switched',CHAIN_LABEL[ch]),'ok');
-    if(source==='backend'&&bePolling)scanCycle(); else renderAll(true);
-  }catch(e){toast(t('toast_chain_fail',e.message),'err');}
+  // 链随请求传递：切链只改本 tab 状态 + 重扫，无需通知后端（无全局链了）
+  curChain=ch;
+  sessionStorage.setItem('aitrader_chain',ch);   // 本 tab 的链（多 tab 互不干扰）
+  localStorage.setItem('aitrader_chain',ch);     // 顺便更新「新 tab 默认链」
+  document.getElementById('chainPill').textContent=CHAIN_LABEL[ch];
+  buyAmount=loadBuyAmt(ch);
+  const ai=document.getElementById('amtInput');if(ai)ai.value=buyAmount;
+  updateAmtUnit();
+  loadingScreen=true;                            // 切链先回骨架，别拿旧链数据糊脸
+  toast(t('toast_chain_switched',CHAIN_LABEL[ch]),'ok');
+  if(source==='backend'&&bePolling)scanCycle(); else renderAll(true);
 }
 /* CA 缩写：前 5 … 后 4；GMGN 代币页链接 */
 const shortCA=a=>a?(a.length>11?a.slice(0,5)+'…'+a.slice(-4):a):'';
@@ -1046,13 +1043,15 @@ async function scanCycle(){
   const sc=document.getElementById('scanning');
   if(source==='backend'){
     if(!bePolling||scanInFlight)return;       // 防重入：上一次没回来就跳过本轮，避免请求堆积雪崩
+    if(document.hidden)return;                 // 后台 tab 暂停轮询，不烧配额（重新可见时立即补一轮）
     scanInFlight=true;
     sc.classList.add('on');const t0=performance.now();
     try{
-      const r=await fetch(API+'/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+      const reqChain=curChain;                   // 记下本次请求的链，返回后比对，切走了就丢弃
+      const r=await fetch(API+'/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chain:reqChain})});
       if(!r.ok)throw new Error('HTTP '+r.status);
       const data=await r.json();
-      if(source!=='backend')return;        // 在途请求返回前用户已切走（如切 DEMO）→ 丢弃，不覆盖
+      if(source!=='backend'||reqChain!==curChain)return;   // 期间切走源/切了链 → 丢弃，不拿旧链数据覆盖
       const {list,risk,positions}=normalize(data);
       loadingScreen=false;                 // 拿到后端响应，结束骨架
       T=list; RISK=risk; if(positions)POS=positions; if(sel>=T.length)sel=-1;
@@ -1100,7 +1099,7 @@ async function openPipe(){
   const cmdEl=document.getElementById('trendCmd');
   cmdEl.value=t('pipe_loading');document.getElementById('pipeState').textContent='';
   try{
-    const r=await fetch(API+'/api/settings');
+    const r=await fetch(API+'/api/settings?chain='+encodeURIComponent(curChain));
     const d=await r.json();
     defaultTrendCmd=d.default_trending_cmd||'';
     cmdEl.value=d.trending_cmd||defaultTrendCmd;
@@ -1134,7 +1133,7 @@ async function savePipe(){
   const cmd=document.getElementById('trendCmd').value.trim();
   ss.innerHTML='<span class="spin"></span>'+t('saving');
   try{
-    const r=await fetch(API+'/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({trending_cmd:cmd})});
+    const r=await fetch(API+'/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({trending_cmd:cmd,chain:curChain})});
     if(!r.ok){const j=await r.json().catch(()=>({}));throw new Error(j.detail||('HTTP '+r.status));}
     applyPollInterval(sec);
     ss.textContent=t('pipe_applied',pollMs/1000);
@@ -1197,7 +1196,7 @@ async function doBuy(){
   if(source==='backend'){
     const bs=document.getElementById('buyState');bs.innerHTML='<span class="spin"></span>'+t('buy_ordering');
     try{
-      const resp=await fetch(API+'/api/buy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({address:r.address||r.addr,size_sol:size})});
+      const resp=await fetch(API+'/api/buy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({address:r.address||r.addr,size_sol:size,chain:curChain})});
       if(!resp.ok)throw new Error(await errDetail(resp));   // 带后端原因(如缺签名密钥/风控硬拦)
       const j=await resp.json();
       // 文案以后端真实返回的 status 为准（SHADOW 不上链就别说“已真实下单”）
@@ -1310,11 +1309,14 @@ applyI18n();tick();
 setInterval(tick,1000);
 pollTimer=setInterval(scanCycle,pollMs);
 setInterval(telemetry,2600);
+// tab 重新可见时立即补一轮（轮询在隐藏时已自动暂停，见 scanCycle）
+document.addEventListener('visibilitychange',()=>{if(!document.hidden&&source==='backend'&&bePolling)scanCycle();});
 
 /* 页面加载即探测后端：环境已有 key 就自动连真实数据，免去每次重填 */
 async function autoConnect(){
-  // 链状态以浏览器缓存为准（不写 env）
-  const savedChain=localStorage.getItem('aitrader_chain')||'sol';
+  // 链是「每个 tab 独立」的视图偏好：本 tab 用 sessionStorage（互不干扰），
+  // localStorage 只作「新 tab 的默认链」种子。
+  const savedChain=sessionStorage.getItem('aitrader_chain')||localStorage.getItem('aitrader_chain')||'sol';
   curChain=savedChain;
   document.getElementById('chainPill').textContent=CHAIN_LABEL[curChain]||'SOL';
   buyAmount=loadBuyAmt(curChain);
@@ -1332,10 +1334,7 @@ async function autoConnect(){
       return;
     }
     if(d.has_key){
-      // 把后端链同步到浏览器保存的链
-      if(d.chain!==curChain){
-        try{await fetch(API+'/api/chain',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chain:curChain})});}catch(e){}
-      }
+      // 链随各请求传递，无需再同步后端全局态（已无全局链）
       setSource('backend');                 // 有后端+key → 直接轮询真实数据（scanCycle 会结束骨架）
       toast(t('toast_connected',CHAIN_LABEL[curChain]),'ok');
       return;
