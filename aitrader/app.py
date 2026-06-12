@@ -142,8 +142,10 @@ TRENDING_CACHE_TTL = 3.0
 # ──────────────────────────────────────────────────────────────────────────
 def write_env(api_key: str, signing_key: str, chain: str):
     ENV_PATH.parent.mkdir(parents=True, exist_ok=True)
+    # 签名私钥是多行 PEM：存成单行（真实换行→字面 \n）并加引号，符合 gmgn-cli .env 约定。
+    sk = (signing_key or "").replace("\r\n", "\n").replace("\n", "\\n")
     body = (f"GMGN_API_KEY={api_key}\n"
-            f"GMGN_PRIVATE_KEY={signing_key}\n"
+            f'GMGN_PRIVATE_KEY="{sk}"\n'
             f"GMGN_CHAIN={chain}\n")
     ENV_PATH.write_text(body)
     try:
@@ -158,7 +160,11 @@ def load_env() -> dict:
     for line in ENV_PATH.read_text().splitlines():
         if "=" in line and not line.strip().startswith("#"):
             k, v = line.split("=", 1)
-            out[k.strip()] = v.strip()
+            v = v.strip()
+            if len(v) >= 2 and v[0] in "\"'" and v[-1] == v[0]:
+                v = v[1:-1]                    # 去包裹引号
+            v = v.replace("\\n", "\n")         # 字面 \n → 真实换行（还原多行 PEM）
+            out[k.strip()] = v
     return out
 
 # ──────────────────────────────────────────────────────────────────────────
