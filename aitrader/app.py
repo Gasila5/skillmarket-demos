@@ -1008,9 +1008,12 @@ def api_config(cfg: ConfigIn):
     # api_key 留空则沿用环境已有的 key（避免空值覆盖、避免每次重填）
     if not cfg.api_key and not env.get("GMGN_API_KEY"):
         raise HTTPException(400, "缺少 api_key（环境也没有）")
-    if cfg.api_key:
-        # 保留环境里已有的默认链（GMGN_CHAIN 只作启动默认，不被 UI 选链快照覆盖）
-        write_env(cfg.api_key, cfg.signing_key, env.get("GMGN_CHAIN") or ST.chain)
+    # 只要这次提交了 api_key 或 signing_key 之一，就落盘；各字段留空=沿用环境已有，不空值覆盖。
+    # （支持「只补签名密钥、API Key 留空」的常见流程）
+    if cfg.api_key or cfg.signing_key:
+        write_env(cfg.api_key or env.get("GMGN_API_KEY", ""),
+                  cfg.signing_key or env.get("GMGN_PRIVATE_KEY", ""),
+                  env.get("GMGN_CHAIN") or ST.chain)   # GMGN_CHAIN 只作启动默认，不被 UI 选链覆盖
     with ST.lock:
         # 安全护栏：LIVE_TRADING_DISABLED 为真时，即使请求 LIVE 也强制 SHADOW（绝不上链）
         want_live = cfg.mode.upper() == "LIVE"
